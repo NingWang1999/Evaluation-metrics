@@ -116,12 +116,19 @@ def main():
 
         pairs_to_test = [
             {"pair_name": "S4_to_S1", "source_file": "S4.pcd", "target_file": "S1.pcd"},
-            {"pair_name": "S3_to_S2", "source_file": "S3.pcd", "target_file": "S2.pcd"}
+            {"pair_name": "S3_to_S2", "source_file": "S3.pcd", "target_file": "S2.pcd"},
+            {"pair_name": "S3_to_S1", "source_file": "S3.pcd", "target_file": "S1.pcd"},
+            {"pair_name": "S4_to_S2", "source_file": "S4.pcd", "target_file": "S2.pcd"},
+            {"pair_name": "S2_to_S1", "source_file": "S2.pcd", "target_file": "S1.pcd"},
+            {"pair_name": "S4_to_S3", "source_file": "S4.pcd", "target_file": "S3.pcd"}
         ]
 
         for pair in pairs_to_test:
             pair_name = pair["pair_name"]
+            
+            # 严格校验：如果在真值txt里没写这个矩阵，就跳过不测（方便你按需增加真值）
             if pair_name not in gt_matrices:
+                print(f"  ⚠️ {pair_name} 不在真值文件内，跳过。")
                 continue
                 
             # 【注意列名：单位全部更新为 mrad 和 mm】
