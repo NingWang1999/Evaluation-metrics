@@ -1,0 +1,4 @@
+*
+!BranchMatch/
+!BranchMatch/**/*
+!.gitignore

@@ -8,22 +8,30 @@ import shutil
 import time
 
 # ==========================================
-# 1. 核心数学计算：误差评估指标
+# 1. 核心数学计算：误差评估指标 (单位换算版)
 # ==========================================
 def compute_transformation_error(T_gt, T_est):
+    """计算旋转误差（mrad）和平移误差（mm）"""
     R_gt, t_gt = T_gt[:3, :3], T_gt[:3, 3]
     R_est, t_est = T_est[:3, :3], T_est[:3, 3]
 
-    e_t = np.linalg.norm(t_gt - t_est)
+    # 平移误差：欧氏距离 (米 -> 毫米)
+    e_t_m = np.linalg.norm(t_gt - t_est)
+    e_t_mm = e_t_m * 1000.0
 
+    # 旋转误差：矩阵迹求角 (弧度 -> 毫弧度)
     R_diff = np.dot(R_gt, R_est.T)
     trace = np.clip(np.trace(R_diff), -1.0, 3.0)
     e_R_rad = np.arccos((trace - 1.0) / 2.0)
-    e_R_deg = np.degrees(e_R_rad)
+    e_R_mrad = e_R_rad * 1000.0
 
-    return e_R_deg, e_t
+    return e_R_mrad, e_t_mm
 
 def compute_pointwise_error(source_pcd, T_gt, T_est):
+    """
+    计算源点云的平均欧氏距离
+    及分解到 X, Y, Z 的绝对距离误差 (全转为 mm)
+    """
     pcd_gt = copy.deepcopy(source_pcd).transform(T_gt)
     pcd_est = copy.deepcopy(source_pcd).transform(T_est)
     
@@ -31,13 +39,16 @@ def compute_pointwise_error(source_pcd, T_gt, T_est):
     pts_est = np.asarray(pcd_est.points)
     
     diff = pts_gt - pts_est
-    e_p = np.mean(np.linalg.norm(diff, axis=1))
     
-    e_x = np.mean(np.abs(diff[:, 0]))
-    e_y = np.mean(np.abs(diff[:, 1]))
-    e_z = np.mean(np.abs(diff[:, 2]))
+    # 整体平均欧氏距离 (米 -> 毫米)
+    e_p_mm = np.mean(np.linalg.norm(diff, axis=1)) * 1000.0
     
-    return e_p, e_x, e_y, e_z
+    # 分量上的平均绝对误差 (米 -> 毫米)
+    e_x_mm = np.mean(np.abs(diff[:, 0])) * 1000.0
+    e_y_mm = np.mean(np.abs(diff[:, 1])) * 1000.0
+    e_z_mm = np.mean(np.abs(diff[:, 2])) * 1000.0
+    
+    return e_p_mm, e_x_mm, e_y_mm, e_z_mm
 
 # ==========================================
 # 2. 复刻 C++ 的去地面预处理逻辑
@@ -113,15 +124,15 @@ def main():
             if pair_name not in gt_matrices:
                 continue
                 
-            # 【提前定义失败占位符，新增耗时记录字段】
+            # 【注意列名：单位全部更新为 mrad 和 mm】
             fail_record = {
                 "Tree": f"Tree{tree_idx}",
                 "Pair": pair_name,
                 "Status": "Failed",
-                "Registration_Time(s)": np.nan,  # <--- 新增时间列
-                "Coarse_Rotation_Error(deg)": np.nan, "Coarse_Translation_Error(m)": np.nan, "Coarse_Pointwise_Error(m)": np.nan,
-                "Fine_Rotation_Error(deg)": np.nan, "Fine_Translation_Error(m)": np.nan, "Fine_Pointwise_Error(m)": np.nan,
-                "Fine_Pointwise_X(m)": np.nan, "Fine_Pointwise_Y(m)": np.nan, "Fine_Pointwise_Z(m)": np.nan
+                "Registration_Time(s)": np.nan,  
+                "Coarse_Rotation_Error(mrad)": np.nan, "Coarse_Translation_Error(mm)": np.nan, "Coarse_Pointwise_Error(mm)": np.nan,
+                "Fine_Rotation_Error(mrad)": np.nan, "Fine_Translation_Error(mm)": np.nan, "Fine_Pointwise_Error(mm)": np.nan,
+                "Fine_Pointwise_X(mm)": np.nan, "Fine_Pointwise_Y(mm)": np.nan, "Fine_Pointwise_Z(mm)": np.nan
             }
 
             # ===============================================
@@ -141,14 +152,14 @@ def main():
             shutil.copy(tgt_path, sandbox_dir)
 
             # ----------------------------------------------------
-            # A. 调度 C++ 执行 (加入 Python 端高精度计时)
+            # A. 调度 C++ 执行 (含防死循环超时熔断)
             # ----------------------------------------------------
             print(f"---> [调用 C++] 正在处理配对: {pair_name}")
             cmd = [cpp_executable, "-dir", sandbox_dir]
             
             time_cost = np.nan
             try:
-                start_t = time.perf_counter() # 使用 perf_counter 获取最高精度的时间
+                start_t = time.perf_counter()
                 subprocess.run(cmd, cwd=sandbox_dir, check=True, timeout=300)
                 end_t = time.perf_counter()
                 
@@ -175,15 +186,25 @@ def main():
             if not os.path.exists(est_filepath_in_sandbox):
                 print(f"  ⚠️ C++ 算法未能找到有效特征配对，无矩阵输出。")
                 fail_record["Status"] = "No_Match"
-                # 记录一下失败跑到哪一步花了多长时间
                 fail_record["Registration_Time(s)"] = time_cost 
                 results.append(fail_record)
                 shutil.rmtree(sandbox_dir, ignore_errors=True)
                 continue
 
+            # ===============================================
             # 移动矩阵文件到安全区
+            # 【强制覆盖机制】
+            # ===============================================
             safe_est_filepath = os.path.join(tree_dir, f"Est_{pair_name}.txt")
+            
+            # 1. 如果外部已经有上次跑出来的旧矩阵文件，毫不留情地删掉！
+            if os.path.exists(safe_est_filepath):
+                os.remove(safe_est_filepath)
+                print(f"  🔄 发现旧的 {pair_name} 矩阵文件，将被覆盖更新。")
+                
+            # 2. 安全地将沙盒里的新矩阵移动出来
             shutil.move(est_filepath_in_sandbox, safe_est_filepath)
+            print(f"  💾 已将最新矩阵安全提取至: Est_{pair_name}.txt")
             
             T_coarse, T_fine = parse_est_txt(safe_est_filepath)
             T_gt = gt_matrices[pair_name]
@@ -193,30 +214,30 @@ def main():
             pcd_source = o3d.io.read_point_cloud(src_path)
             pcd_source_no_ground = remove_ground_ransac(pcd_source)
             
-            # 计算误差
+            # 计算误差 (单位: mrad, mm)
             e_R_c, e_t_c = compute_transformation_error(T_gt, T_coarse)
             e_p_c, _, _, _ = compute_pointwise_error(pcd_source_no_ground, T_gt, T_coarse)
             
             e_R_f, e_t_f = compute_transformation_error(T_gt, T_fine)
             e_p_f, e_x_f, e_y_f, e_z_f = compute_pointwise_error(pcd_source_no_ground, T_gt, T_fine)
             
-            # 记录成功数据
+            # 【记录成功数据：列名全部改为新单位】
             results.append({
                 "Tree": f"Tree{tree_idx}",
                 "Pair": pair_name,
                 "Status": "Success",  
-                "Registration_Time(s)": time_cost, # <--- 耗时完美入库
-                "Coarse_Rotation_Error(deg)": e_R_c,
-                "Coarse_Translation_Error(m)": e_t_c,
-                "Coarse_Pointwise_Error(m)": e_p_c,
-                "Fine_Rotation_Error(deg)": e_R_f,
-                "Fine_Translation_Error(m)": e_t_f,
-                "Fine_Pointwise_Error(m)": e_p_f,
-                "Fine_Pointwise_X(m)": e_x_f,  
-                "Fine_Pointwise_Y(m)": e_y_f,  
-                "Fine_Pointwise_Z(m)": e_z_f   
+                "Registration_Time(s)": time_cost,
+                "Coarse_Rotation_Error(mrad)": e_R_c,
+                "Coarse_Translation_Error(mm)": e_t_c,
+                "Coarse_Pointwise_Error(mm)": e_p_c,
+                "Fine_Rotation_Error(mrad)": e_R_f,
+                "Fine_Translation_Error(mm)": e_t_f,
+                "Fine_Pointwise_Error(mm)": e_p_f,
+                "Fine_Pointwise_X(mm)": e_x_f,  
+                "Fine_Pointwise_Y(mm)": e_y_f,  
+                "Fine_Pointwise_Z(mm)": e_z_f   
             })
-            print(f"    📊 粗配MAE: {e_p_c:.4f}m | 精配MAE: {e_p_f:.4f}m | 耗时: {time_cost:.2f}s")
+            print(f"    📊 粗配MAE: {e_p_c:.2f}mm | 精配MAE: {e_p_f:.2f}mm | 耗时: {time_cost:.2f}s")
 
             # ===============================================
             # C. 跑完清理沙盒，彻底销毁垃圾点云！
